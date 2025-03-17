@@ -4,10 +4,12 @@ use std::{
     io::{BufWriter, Write},
     path::PathBuf,
     process::ExitCode,
+    sync::mpsc,
+    thread,
 };
 
-use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::{Context, Result};
 use clap::Parser;
 use itertools::Itertools;
 use pnet::packet::{
@@ -31,7 +33,7 @@ struct SeqData {
     size: u16,
 }
 
-trait FlowParser {
+trait FlowParser: Send {
     fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket);
 
     fn get_seqs(&self) -> HashMap<u64, SeqData>;
@@ -66,14 +68,68 @@ impl FlowParser for Iperf3Udp {
     }
 }
 
-type PortParserMap = HashMap<u16, Box<dyn FlowParser>>;
+#[derive(Default, Clone)]
+struct Irtt {
+    seqs: HashMap<u64, SeqData>,
+}
+
+/// IRTT Packet format (with hmac):
+/// 0        4        8        12       16       20       24       28       32
+/// magic fl ???      ???      ???      ???      conn token ???    seqno
+/// 14a75b08 6023db39 486483de 51d86cde 57644032 18b2454b 21b6f281 12000000 000...
+/// 14a75b08 bd63b501 1ed5e142 6dea9561 9e134506 18b2454b 21b6f281 13000000 000...
+/// 14a75b08 13ac2779 6eb08c31 67bf3ee2 7d8abc0a 18b2454b 21b6f281 14000000 000...
+impl FlowParser for Irtt {
+    fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket) {
+        if udp.payload().len() < 32 {
+            return;
+        }
+
+        let flags = udp.payload()[3];
+        if !(flags == 8 || flags == 10) {
+            return;
+        }
+
+        let seq_bytes = &udp.payload()[28..32];
+        let seq = u32::from_le_bytes(seq_bytes.try_into().unwrap()) as u64;
+
+        if self.seqs.contains_key(&seq) {
+            eprintln!(
+                "irtt {}->{}: seq {} received twice",
+                udp.get_source(),
+                udp.get_destination(),
+                seq
+            );
+            return;
+        }
+        self.seqs.insert(seq, SeqData { ts, size });
+    }
+
+    fn get_seqs(&self) -> HashMap<u64, SeqData> {
+        self.seqs.clone()
+    }
+}
+
+type PortParserMap = HashMap<u16, Box<dyn FlowParser + Send>>;
 
 fn prepare_port_map(args: &cli::Args) -> PortParserMap {
     let mut port_map: HashMap<u16, _> = HashMap::new();
 
     if let Some(ports) = args.iperf3_ports.as_ref() {
         for port in ports {
-            port_map.insert(*port, Box::new(Iperf3Udp::default()) as Box<dyn FlowParser>);
+            port_map.insert(
+                *port,
+                Box::new(Iperf3Udp::default()) as Box<dyn FlowParser + Send>,
+            );
+        }
+    }
+
+    if let Some(ports) = args.irtt_ports.as_ref() {
+        for port in ports {
+            port_map.insert(
+                *port,
+                Box::new(Irtt::default()) as Box<dyn FlowParser + Send>,
+            );
         }
     }
 
@@ -81,7 +137,7 @@ fn prepare_port_map(args: &cli::Args) -> PortParserMap {
 }
 
 fn parse_pcap(path: String, mut port_map: PortParserMap) -> Result<PortParserMap> {
-    let mut cap = pcap::Capture::from_file(path)?;
+    let mut cap = pcap::Capture::from_file(path).context("Failed opening pcap")?;
 
     let datalink = cap.get_datalink();
     if datalink != pcap::Linktype::LINUX_SLL2 {
@@ -174,50 +230,72 @@ fn write_out(args: &cli::Args, results: ResultMap) -> Result<()> {
     let base_path = PathBuf::from(args.sndr_pcap.clone());
     let base_path = base_path.parent().unwrap();
 
-    let header = "ts_sent\tts_rcvd\tseq_unwr\tlatency_ms\tlen\tlost\n".as_bytes();
+    let header = "ts_sent\tts_rcvd\tseq\tlatency_ms\tlen\tlost\n".as_bytes();
 
     for (port, seqs) in results.iter() {
         let file_name = format!("{name}.{port}.csv");
         let path_out = base_path.join(file_name);
-        // let mut wtr = csv::Writer::from_path(path_out)?;
-        let f = File::create(path_out)?;
+        let f = File::create(path_out).context("Failed opening csv file for writing")?;
         let mut f = BufWriter::new(f);
 
-        // ts_sent', 'ts_rcvd', 'dst_port', 'seq_unwr', 'latency_ms', 'len'
-
-        
-        f.write(header)?;
+        f.write(header).context("Failed writing csv header")?;
 
         for seq_result in seqs {
             f.write(seq_result.to_csv_row().as_bytes())?;
         }
-
-        // f.flush()?;
     }
 
     Ok(())
 }
 
 fn main() -> ExitCode {
-    // Parse CLI parameters.
     let args = cli::Args::parse();
 
-    if args.iperf3_ports.as_ref().is_none() || args.iperf3_ports.as_ref().unwrap().len() == 0 {
+    let (tx_sndr, rx) = mpsc::channel();
+    let tx_rcvr = tx_sndr.clone();
+
+    let sndr_pcap = args.sndr_pcap.clone();
+    let rcvr_pcap = args.rcvr_pcap.clone();
+    let sndr_parsers = prepare_port_map(&args);
+    let rcvr_parsers = prepare_port_map(&args);
+
+    if sndr_parsers.len() == 0 {
         eprintln!("No ports passed");
         return ExitCode::FAILURE;
     }
 
-    println!("Parsing {}", args.sndr_pcap);
-    let sndr_parsers = prepare_port_map(&args);
-    let sndr_parsers = parse_pcap(args.sndr_pcap.clone(), sndr_parsers).unwrap();
+    thread::spawn(move || {
+        eprintln!("Parsing {}", sndr_pcap);
+        let parsers = parse_pcap(sndr_pcap, sndr_parsers);
+        tx_sndr.send(("sndr", parsers)).unwrap();
+    });
 
-    println!("Parsing {}", args.rcvr_pcap);
-    let rcvr_parsers = prepare_port_map(&args);
-    let rcvr_parsers = parse_pcap(args.rcvr_pcap.clone(), rcvr_parsers).unwrap();
+    thread::spawn(move || {
+        eprintln!("Parsing {}", rcvr_pcap);
+        let parsers = parse_pcap(rcvr_pcap, rcvr_parsers);
+        tx_rcvr.send(("rcvr", parsers)).unwrap();
+    });
 
-    let results = match_parsers(sndr_parsers, rcvr_parsers);
+    let mut sndr_parsers = None;
+    let mut rcvr_parsers = None;
+    while sndr_parsers.is_none() || rcvr_parsers.is_none() {
+        match rx.recv().unwrap() {
+            (name, Err(e)) => {
+                eprintln!("Parsing {}: {}", name, e);
+                return ExitCode::FAILURE;
+            }
+            ("sndr", Ok(v)) => sndr_parsers = Some(v),
+            ("rcvr", Ok(v)) => rcvr_parsers = Some(v),
+            _ => panic!("Should be unreachable"),
+        }
+    }
 
-    write_out(&args, results).unwrap();
+    let results = match_parsers(sndr_parsers.unwrap(), rcvr_parsers.unwrap());
+
+    if let Err(e) = write_out(&args, results) {
+        eprintln!("{}", e);
+        return ExitCode::FAILURE;
+    }
 
     ExitCode::SUCCESS
 }

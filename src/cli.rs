@@ -1,7 +1,9 @@
 use clap::ArgAction;
 use clap::Parser;
 
-#[derive(Parser, Debug)]
+const PORTS_HEADING: &str = "Port Matching";
+
+#[derive(Parser, Debug, Clone)]
 #[command(author, about)]
 pub struct Args {
     /// Sender pcap
@@ -20,6 +22,9 @@ pub struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     pub split: bool,
 
-    #[arg(long)]
+    #[arg(long, help_heading = PORTS_HEADING)]
     pub iperf3_ports: Option<Vec<u16>>,
+
+    #[arg(long, help_heading = PORTS_HEADING)]
+    pub irtt_ports: Option<Vec<u16>>,
 }
