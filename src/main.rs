@@ -1,3 +1,4 @@
+use core::f64;
 use std::{
     collections::HashMap,
     fs::File,
@@ -140,7 +141,7 @@ fn hashmap_match_with(
             ts_sent: timeval_to_jiff(sent.ts),
             ts_rcvd: jiff::Timestamp::new(0, 0).unwrap(),
             seq: *seq,
-            owd_ms: -1.0,
+            owd_ms: f64::NAN,
             len: sent.size,
             lost: true,
         };
