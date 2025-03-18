@@ -296,6 +296,10 @@ fn match_parsers(sndr: ParserMatcher, rcvr: ParserMatcher) -> ResultMap {
     for (key, sndr_parser) in sndr.iter_parsers() {
         let rcvr_parser = rcvr.get_parser(key).unwrap();
         let result = hashmap_match_with(sndr_parser.get_packets(), rcvr_parser.get_packets());
+        let negative_owd_count = result.iter().filter(|r| f64::is_nan(r.owd_ms) && r.owd_ms < 0.0).count();
+        if negative_owd_count > 0 {
+            eprintln!("Port {}: encountered {} packets with negative latency", key.1.port(), negative_owd_count);
+        }
         if let Some(_) = results.insert(key.1.port(), result) {
             eprintln!("Port {} parsed twice", key.1.port());
         }
