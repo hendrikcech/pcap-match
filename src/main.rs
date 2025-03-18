@@ -156,7 +156,7 @@ fn hashmap_match_with(
     result
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy)]
+#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 enum PortType {
     Src,
     Dst,
@@ -192,11 +192,12 @@ impl ParserMatcher {
         }
     }
 
-    fn match_packet(&mut self, ip: Ipv4Addr, ts: timeval, size: u16, udp: &UdpPacket<'_>) {
-        let dst_specific_addr = SocketAddr::new(IpAddr::V4(ip), udp.get_destination());
+    fn match_packet(&mut self, ipv4: &Ipv4Packet<'_>, udp: &UdpPacket<'_>, ts: timeval, size: u16) {
+        let dst_specific_addr =
+            SocketAddr::new(IpAddr::V4(ipv4.get_destination()), udp.get_destination());
         let dst_wildcard_addr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), udp.get_destination());
-        let src_specific_addr = SocketAddr::new(IpAddr::V4(ip), udp.get_source());
+        let src_specific_addr = SocketAddr::new(IpAddr::V4(ipv4.get_source()), udp.get_source());
         let src_wildcard_addr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), udp.get_source());
 
@@ -247,10 +248,9 @@ fn parse_pcap(path: String, mut parsers: ParserMatcher) -> Result<ParserMatcher>
                 if let Some(ipv4) = Ipv4Packet::new(sll2.payload()) {
                     if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
                         if let Some(udp) = UdpPacket::new(ipv4.payload()) {
-                            let ip = ipv4.get_destination();
                             let ts = packet.header.ts;
                             let size = ipv4.get_total_length() + 20;
-                            parsers.match_packet(ip, ts, size, &udp);
+                            parsers.match_packet(&ipv4, &udp, ts, size);
                         }
                     }
                 }
