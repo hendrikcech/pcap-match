@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufWriter, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::ExitCode,
     sync::mpsc,
@@ -27,8 +28,24 @@ fn timeval_to_jiff(ts: timeval) -> jiff::Timestamp {
     jiff::Timestamp::new(ts.tv_sec, ns.try_into().unwrap()).unwrap()
 }
 
+type BoxedFlowParser = Box<dyn FlowParser + Send>;
+
+enum FlowParsers {
+    Iperf3Udp,
+    Irtt,
+}
+
+impl FlowParsers {
+    fn new(&self) -> BoxedFlowParser {
+        match self {
+            FlowParsers::Iperf3Udp => Box::new(Iperf3UdpParser::default()),
+            FlowParsers::Irtt => Box::new(IrttParser::default()),
+        }
+    }
+}
+
 #[derive(Clone)]
-struct SeqData {
+struct PacketData {
     ts: timeval,
     size: u16,
 }
@@ -36,15 +53,15 @@ struct SeqData {
 trait FlowParser: Send {
     fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket);
 
-    fn get_seqs(&self) -> HashMap<u64, SeqData>;
+    fn get_packets(&self) -> &HashMap<u64, PacketData>;
 }
 
 #[derive(Default, Clone)]
-struct Iperf3Udp {
-    seqs: HashMap<u64, SeqData>,
+struct Iperf3UdpParser {
+    seqs: HashMap<u64, PacketData>,
 }
 
-impl FlowParser for Iperf3Udp {
+impl FlowParser for Iperf3UdpParser {
     fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket) {
         if udp.payload().len() < 12 {
             return;
@@ -60,17 +77,17 @@ impl FlowParser for Iperf3Udp {
             );
             return;
         }
-        self.seqs.insert(seq, SeqData { ts, size });
+        self.seqs.insert(seq, PacketData { ts, size });
     }
 
-    fn get_seqs(&self) -> HashMap<u64, SeqData> {
-        self.seqs.clone()
+    fn get_packets(&self) -> &HashMap<u64, PacketData> {
+        &self.seqs
     }
 }
 
 #[derive(Default, Clone)]
-struct Irtt {
-    seqs: HashMap<u64, SeqData>,
+struct IrttParser {
+    seqs: HashMap<u64, PacketData>,
 }
 
 /// IRTT Packet format (with hmac):
@@ -79,7 +96,7 @@ struct Irtt {
 /// 14a75b08 6023db39 486483de 51d86cde 57644032 18b2454b 21b6f281 12000000 000...
 /// 14a75b08 bd63b501 1ed5e142 6dea9561 9e134506 18b2454b 21b6f281 13000000 000...
 /// 14a75b08 13ac2779 6eb08c31 67bf3ee2 7d8abc0a 18b2454b 21b6f281 14000000 000...
-impl FlowParser for Irtt {
+impl FlowParser for IrttParser {
     fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket) {
         if udp.payload().len() < 32 {
             return;
@@ -102,41 +119,118 @@ impl FlowParser for Irtt {
             );
             return;
         }
-        self.seqs.insert(seq, SeqData { ts, size });
+        self.seqs.insert(seq, PacketData { ts, size });
     }
 
-    fn get_seqs(&self) -> HashMap<u64, SeqData> {
-        self.seqs.clone()
+    fn get_packets(&self) -> &HashMap<u64, PacketData> {
+        &self.seqs
     }
 }
 
-type PortParserMap = HashMap<u16, Box<dyn FlowParser + Send>>;
+/// Can handle iperf3 and irtt packets. Should ideally be a trait on
+/// the FlowParsers but I couldn't get it to work with Rust...
+fn hashmap_match_with(
+    sndr: &HashMap<u64, PacketData>,
+    rcvr: &HashMap<u64, PacketData>,
+) -> Vec<SeqResult> {
+    let mut result: Vec<SeqResult> = Vec::new();
 
-fn prepare_port_map(args: &cli::Args) -> PortParserMap {
-    let mut port_map: HashMap<u16, _> = HashMap::new();
-
-    if let Some(ports) = args.iperf3.as_ref() {
-        for port in ports {
-            port_map.insert(
-                *port,
-                Box::new(Iperf3Udp::default()) as Box<dyn FlowParser + Send>,
-            );
-        }
+    for (seq, sent) in sndr.iter().sorted_by_key(|(k, _)| **k) {
+        let mut res = SeqResult {
+            ts_sent: timeval_to_jiff(sent.ts),
+            ts_rcvd: jiff::Timestamp::new(0, 0).unwrap(),
+            seq: *seq,
+            owd_ms: -1.0,
+            len: sent.size,
+            lost: true,
+        };
+        if let Some(rcvd) = rcvr.get(seq) {
+            res.ts_rcvd = timeval_to_jiff(rcvd.ts);
+            let owd = timeval_to_jiff(rcvd.ts) - res.ts_sent;
+            res.owd_ms = owd.total(jiff::Unit::Millisecond).unwrap();
+            res.lost = false;
+        };
+        result.push(res);
     }
 
-    if let Some(ports) = args.irtt.as_ref() {
-        for port in ports {
-            port_map.insert(
-                *port,
-                Box::new(Irtt::default()) as Box<dyn FlowParser + Send>,
-            );
-        }
-    }
-
-    port_map
+    result
 }
 
-fn parse_pcap(path: String, mut port_map: PortParserMap) -> Result<PortParserMap> {
+#[derive(Eq, Hash, PartialEq, Clone, Copy)]
+enum PortType {
+    Src,
+    Dst,
+}
+
+#[derive(Default)]
+struct ParserMatcher {
+    map: HashMap<(PortType, SocketAddr), BoxedFlowParser>,
+}
+
+impl ParserMatcher {
+    fn new(args: &cli::Args) -> ParserMatcher {
+        let mut m = Self::default();
+
+        m.add_addrs(&args.iperf3_udp_dst, PortType::Dst, FlowParsers::Iperf3Udp);
+        m.add_addrs(&args.iperf3_udp_src, PortType::Src, FlowParsers::Iperf3Udp);
+        m.add_addrs(&args.irtt_dst, PortType::Dst, FlowParsers::Irtt);
+        m.add_addrs(&args.irtt_src, PortType::Src, FlowParsers::Irtt);
+
+        m
+    }
+
+    fn add_addrs(
+        &mut self,
+        addrs: &Option<Vec<SocketAddr>>,
+        port_type: PortType,
+        parser: FlowParsers,
+    ) {
+        if let Some(addrs) = addrs {
+            for addr in addrs {
+                self.map.insert((port_type, *addr), parser.new());
+            }
+        }
+    }
+
+    fn match_packet(&mut self, ip: Ipv4Addr, ts: timeval, size: u16, udp: &UdpPacket<'_>) {
+        let dst_specific_addr = SocketAddr::new(IpAddr::V4(ip), udp.get_destination());
+        let dst_wildcard_addr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), udp.get_destination());
+        let src_specific_addr = SocketAddr::new(IpAddr::V4(ip), udp.get_source());
+        let src_wildcard_addr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), udp.get_source());
+
+        let parser = if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_wildcard_addr)) {
+            Some(parser)
+        } else if let Some(parser) = self.map.get_mut(&(PortType::Src, src_wildcard_addr)) {
+            Some(parser)
+        } else if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_specific_addr)) {
+            Some(parser)
+        } else if let Some(parser) = self.map.get_mut(&(PortType::Src, src_specific_addr)) {
+            Some(parser)
+        } else {
+            None
+        };
+
+        if let Some(parser) = parser {
+            parser.parse(ts, size, udp);
+        }
+    }
+
+    fn iter_parsers(&self) -> impl Iterator<Item = (&(PortType, SocketAddr), &BoxedFlowParser)> {
+        self.map.iter()
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn get_parser(&self, key: &(PortType, SocketAddr)) -> Option<&BoxedFlowParser> {
+        self.map.get(key)
+    }
+}
+
+fn parse_pcap(path: String, mut parsers: ParserMatcher) -> Result<ParserMatcher> {
     let mut cap = pcap::Capture::from_file(path).context("Failed opening pcap")?;
 
     let datalink = cap.get_datalink();
@@ -153,11 +247,10 @@ fn parse_pcap(path: String, mut port_map: PortParserMap) -> Result<PortParserMap
                 if let Some(ipv4) = Ipv4Packet::new(sll2.payload()) {
                     if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
                         if let Some(udp) = UdpPacket::new(ipv4.payload()) {
-                            if let Some(parser) = port_map.get_mut(&udp.get_destination()) {
-                                let ts = packet.header.ts;
-                                let size = ipv4.get_total_length() + 20;
-                                parser.parse(ts, size, &udp);
-                            }
+                            let ip = ipv4.get_destination();
+                            let ts = packet.header.ts;
+                            let size = ipv4.get_total_length() + 20;
+                            parsers.match_packet(ip, ts, size, &udp);
                         }
                     }
                 }
@@ -167,10 +260,8 @@ fn parse_pcap(path: String, mut port_map: PortParserMap) -> Result<PortParserMap
         }
     }
 
-    Ok(port_map)
+    Ok(parsers)
 }
-
-type ResultMap = HashMap<u16, Vec<SeqResult>>;
 
 #[derive(Debug)]
 struct SeqResult {
@@ -196,30 +287,17 @@ impl SeqResult {
     }
 }
 
-fn match_parsers(sndr: PortParserMap, rcvr: PortParserMap) -> ResultMap {
+type ResultMap = HashMap<u16, Vec<SeqResult>>;
+
+fn match_parsers(sndr: ParserMatcher, rcvr: ParserMatcher) -> ResultMap {
     let mut results: ResultMap = HashMap::new();
 
-    for (port, sndr_parser) in sndr.iter() {
-        let mut port_result: Vec<SeqResult> = Vec::new();
-        let rcvr_seqs = rcvr.get(port).unwrap().get_seqs();
-        for (seq, sent) in sndr_parser.get_seqs().iter().sorted_by_key(|(k, _)| **k) {
-            let mut res = SeqResult {
-                ts_sent: timeval_to_jiff(sent.ts),
-                ts_rcvd: jiff::Timestamp::new(0, 0).unwrap(),
-                seq: *seq,
-                owd_ms: -1.0,
-                len: sent.size,
-                lost: true,
-            };
-            if let Some(rcvd) = rcvr_seqs.get(seq) {
-                res.ts_rcvd = timeval_to_jiff(rcvd.ts);
-                let owd = timeval_to_jiff(rcvd.ts) - res.ts_sent;
-                res.owd_ms = owd.total(jiff::Unit::Millisecond).unwrap();
-                res.lost = false;
-            };
-            port_result.push(res);
+    for (key, sndr_parser) in sndr.iter_parsers() {
+        let rcvr_parser = rcvr.get_parser(key).unwrap();
+        let result = hashmap_match_with(sndr_parser.get_packets(), rcvr_parser.get_packets());
+        if let Some(_) = results.insert(key.1.port(), result) {
+            eprintln!("Port {} parsed twice", key.1.port());
         }
-        results.insert(*port, port_result);
     }
 
     results
@@ -256,11 +334,11 @@ fn main() -> ExitCode {
 
     let sndr_pcap = args.sndr_pcap.clone();
     let rcvr_pcap = args.rcvr_pcap.clone();
-    let sndr_parsers = prepare_port_map(&args);
-    let rcvr_parsers = prepare_port_map(&args);
+    let sndr_parsers = ParserMatcher::new(&args);
+    let rcvr_parsers = ParserMatcher::new(&args);
 
     if sndr_parsers.len() == 0 {
-        eprintln!("No ports passed");
+        eprintln!("No addresses passed");
         return ExitCode::FAILURE;
     }
 
