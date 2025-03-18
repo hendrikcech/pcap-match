@@ -115,7 +115,7 @@ type PortParserMap = HashMap<u16, Box<dyn FlowParser + Send>>;
 fn prepare_port_map(args: &cli::Args) -> PortParserMap {
     let mut port_map: HashMap<u16, _> = HashMap::new();
 
-    if let Some(ports) = args.iperf3_ports.as_ref() {
+    if let Some(ports) = args.iperf3.as_ref() {
         for port in ports {
             port_map.insert(
                 *port,
@@ -124,7 +124,7 @@ fn prepare_port_map(args: &cli::Args) -> PortParserMap {
         }
     }
 
-    if let Some(ports) = args.irtt_ports.as_ref() {
+    if let Some(ports) = args.irtt.as_ref() {
         for port in ports {
             port_map.insert(
                 *port,

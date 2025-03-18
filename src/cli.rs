@@ -22,9 +22,11 @@ pub struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     pub split: bool,
 
+    /// Match these iperf3 (UDP mode) ports
     #[arg(long, help_heading = PORTS_HEADING)]
-    pub iperf3_ports: Option<Vec<u16>>,
+    pub iperf3: Option<Vec<u16>>,
 
+    /// Match these IRTT ports
     #[arg(long, help_heading = PORTS_HEADING)]
-    pub irtt_ports: Option<Vec<u16>>,
+    pub irtt: Option<Vec<u16>>,
 }
