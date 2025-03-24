@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufWriter, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     process::ExitCode,
     sync::mpsc,
@@ -14,8 +14,14 @@ use anyhow::anyhow;
 use anyhow::{Context, Result};
 use clap::Parser;
 use itertools::Itertools;
+use pcap::PacketHeader;
 use pnet::packet::{
-    Packet, ethernet::EtherTypes, ip::IpNextHeaderProtocols, ipv4::Ipv4Packet, sll2::SLL2Packet,
+    Packet,
+    ethernet::{EtherType, EtherTypes, EthernetPacket},
+    ip::IpNextHeaderProtocols,
+    ipv4::Ipv4Packet,
+    ipv6::Ipv6Packet,
+    sll2::SLL2Packet,
     udp::UdpPacket,
 };
 
@@ -193,18 +199,31 @@ impl ParserMatcher {
         }
     }
 
-    fn match_packet(&mut self, ipv4: &Ipv4Packet<'_>, udp: &UdpPacket<'_>, ts: timeval, size: u16) {
-        let dst_specific_addr =
-            SocketAddr::new(IpAddr::V4(ipv4.get_destination()), udp.get_destination());
-        let dst_wildcard_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), udp.get_destination());
-        let src_specific_addr = SocketAddr::new(IpAddr::V4(ipv4.get_source()), udp.get_source());
-        let src_wildcard_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), udp.get_source());
+    fn match_packet(
+        &mut self,
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
+        udp: &UdpPacket<'_>,
+        ts: timeval,
+        size: u16,
+    ) {
+        let ipv4_wildcard = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+        let ipv6_wildcard = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0));
+        let dst_specific_addr = SocketAddr::new(ip_dst, udp.get_destination());
+        let src_specific_addr = SocketAddr::new(ip_src, udp.get_source());
 
-        let parser = if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_wildcard_addr)) {
+        let dst_v4_addr = SocketAddr::new(ipv4_wildcard, udp.get_destination());
+        let src_v4_addr = SocketAddr::new(ipv4_wildcard, udp.get_source());
+        let dst_v6_addr = SocketAddr::new(ipv6_wildcard, udp.get_destination());
+        let src_v6_addr = SocketAddr::new(ipv6_wildcard, udp.get_source());
+
+        let parser = if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_v4_addr)) {
             Some(parser)
-        } else if let Some(parser) = self.map.get_mut(&(PortType::Src, src_wildcard_addr)) {
+        } else if let Some(parser) = self.map.get_mut(&(PortType::Src, src_v4_addr)) {
+            Some(parser)
+        } else if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_v6_addr)) {
+            Some(parser)
+        } else if let Some(parser) = self.map.get_mut(&(PortType::Src, src_v6_addr)) {
             Some(parser)
         } else if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_specific_addr)) {
             Some(parser)
@@ -236,32 +255,88 @@ fn parse_pcap(path: String, mut parsers: ParserMatcher) -> Result<ParserMatcher>
     let mut cap = pcap::Capture::from_file(path).context("Failed opening pcap")?;
 
     let datalink = cap.get_datalink();
-    if datalink != pcap::Linktype::LINUX_SLL2 {
-        return Err(anyhow!(
-            "Can't parse pcap datalink {:?}; currently only LINUX_SLL2 upported",
-            datalink
-        ));
-    };
 
     while let Ok(packet) = cap.next_packet() {
-        if let Some(sll2) = SLL2Packet::new(packet.data) {
-            if sll2.get_protocol_type() == EtherTypes::Ipv4 {
-                if let Some(ipv4) = Ipv4Packet::new(sll2.payload()) {
-                    if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
-                        if let Some(udp) = UdpPacket::new(ipv4.payload()) {
-                            let ts = packet.header.ts;
-                            let size = ipv4.get_total_length() + 20;
-                            parsers.match_packet(&ipv4, &udp, ts, size);
-                        }
+        match datalink {
+            pcap::Linktype::LINUX_SLL2 => {
+                if let Some(sll2) = SLL2Packet::new(packet.data) {
+                    parse_packet(
+                        &mut parsers,
+                        packet.header,
+                        sll2.get_protocol_type(),
+                        sll2.payload(),
+                    )?;
+                } else {
+                    eprintln!("Failed to assemble SSL2Packet");
+                }
+            }
+            pcap::Linktype::ETHERNET => {
+                if let Some(eth) = EthernetPacket::new(packet.data) {
+                    parse_packet(
+                        &mut parsers,
+                        packet.header,
+                        eth.get_ethertype(),
+                        eth.payload(),
+                    )?;
+                } else {
+                    eprintln!("Failed to assemble EthernetPacket");
+                }
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Can't parse pcap datalink {:?}; currently only LINUX_SLL2 upported",
+                    datalink
+                ));
+            }
+        };
+    }
+    Ok(parsers)
+}
+
+fn parse_packet(
+    parsers: &mut ParserMatcher,
+    header: &PacketHeader,
+    eth_type: EtherType,
+    payload: &[u8],
+) -> Result<()> {
+    let ts = header.ts;
+    match eth_type {
+        EtherTypes::Ipv4 => {
+            if let Some(ipv4) = Ipv4Packet::new(payload) {
+                if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
+                    if let Some(udp) = UdpPacket::new(ipv4.payload()) {
+                        let size = ipv4.get_total_length() + 20;
+                        parsers.match_packet(
+                            IpAddr::V4(ipv4.get_source()),
+                            IpAddr::V4(ipv4.get_destination()),
+                            &udp,
+                            ts,
+                            size,
+                        );
                     }
                 }
-            } else {
-                eprintln!("unsupported sll2.protocol={}", sll2.get_protocol_type());
             }
         }
-    }
+        EtherTypes::Ipv6 => {
+            if let Some(ipv6) = Ipv6Packet::new(payload) {
+                if ipv6.get_next_header() == IpNextHeaderProtocols::Udp {
+                    if let Some(udp) = UdpPacket::new(ipv6.payload()) {
+                        let size = ipv6.get_payload_length() + 40;
+                        parsers.match_packet(
+                            IpAddr::V6(ipv6.get_source()),
+                            IpAddr::V6(ipv6.get_destination()),
+                            &udp,
+                            ts,
+                            size,
+                        );
+                    }
+                }
+            }
+        }
+        _ => eprintln!("unsupported ether type={}", eth_type),
+    };
 
-    Ok(parsers)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -296,9 +371,16 @@ fn match_parsers(sndr: ParserMatcher, rcvr: ParserMatcher) -> ResultMap {
     for (key, sndr_parser) in sndr.iter_parsers() {
         let rcvr_parser = rcvr.get_parser(key).unwrap();
         let result = hashmap_match_with(sndr_parser.get_packets(), rcvr_parser.get_packets());
-        let negative_owd_count = result.iter().filter(|r| f64::is_nan(r.owd_ms) && r.owd_ms < 0.0).count();
+        let negative_owd_count = result
+            .iter()
+            .filter(|r| f64::is_nan(r.owd_ms) && r.owd_ms < 0.0)
+            .count();
         if negative_owd_count > 0 {
-            eprintln!("Port {}: encountered {} packets with negative latency", key.1.port(), negative_owd_count);
+            eprintln!(
+                "Port {}: encountered {} packets with negative latency",
+                key.1.port(),
+                negative_owd_count
+            );
         }
         if let Some(_) = results.insert(key.1.port(), result) {
             eprintln!("Port {} parsed twice", key.1.port());
