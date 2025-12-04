@@ -13,155 +13,24 @@ use std::{
 use anyhow::anyhow;
 use anyhow::{Context, Result};
 use clap::Parser;
-use itertools::Itertools;
 use pcap::PacketHeader;
 use pnet::packet::{
     Packet,
     ethernet::{EtherType, EtherTypes, EthernetPacket},
-    ip::IpNextHeaderProtocols,
+    ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
     ipv4::Ipv4Packet,
     ipv6::Ipv6Packet,
     sll2::SLL2Packet,
+    tcp::TcpPacket,
     udp::UdpPacket,
 };
 
 use libc::timeval;
 
+use crate::parsers::{AvailableFlowParsers, FlowParsers};
+
 mod cli;
-
-#[inline(always)]
-fn timeval_to_jiff(ts: timeval) -> jiff::Timestamp {
-    let ns = ts.tv_usec * 1000;
-    jiff::Timestamp::new(ts.tv_sec, ns.try_into().unwrap()).unwrap()
-}
-
-type BoxedFlowParser = Box<dyn FlowParser + Send>;
-
-enum FlowParsers {
-    Iperf3Udp,
-    Irtt,
-}
-
-impl FlowParsers {
-    fn new(&self) -> BoxedFlowParser {
-        match self {
-            FlowParsers::Iperf3Udp => Box::new(Iperf3UdpParser::default()),
-            FlowParsers::Irtt => Box::new(IrttParser::default()),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct PacketData {
-    ts: timeval,
-    size: u16,
-}
-
-trait FlowParser: Send {
-    fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket);
-
-    fn get_packets(&self) -> &HashMap<u64, PacketData>;
-}
-
-#[derive(Default, Clone)]
-struct Iperf3UdpParser {
-    seqs: HashMap<u64, PacketData>,
-}
-
-impl FlowParser for Iperf3UdpParser {
-    fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket) {
-        if udp.payload().len() < 12 {
-            return;
-        }
-        let seq_bytes = &udp.payload()[8..12];
-        let seq = u32::from_be_bytes(seq_bytes.try_into().unwrap()) as u64;
-        if self.seqs.contains_key(&seq) {
-            eprintln!(
-                "iperf3 {}->{}: seq {} received twice",
-                udp.get_source(),
-                udp.get_destination(),
-                seq
-            );
-            return;
-        }
-        self.seqs.insert(seq, PacketData { ts, size });
-    }
-
-    fn get_packets(&self) -> &HashMap<u64, PacketData> {
-        &self.seqs
-    }
-}
-
-#[derive(Default, Clone)]
-struct IrttParser {
-    seqs: HashMap<u64, PacketData>,
-}
-
-/// IRTT Packet format (with hmac):
-/// 0        4        8        12       16       20       24       28       32
-/// magic fl ???      ???      ???      ???      conn token ???    seqno
-/// 14a75b08 6023db39 486483de 51d86cde 57644032 18b2454b 21b6f281 12000000 000...
-/// 14a75b08 bd63b501 1ed5e142 6dea9561 9e134506 18b2454b 21b6f281 13000000 000...
-/// 14a75b08 13ac2779 6eb08c31 67bf3ee2 7d8abc0a 18b2454b 21b6f281 14000000 000...
-impl FlowParser for IrttParser {
-    fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket) {
-        if udp.payload().len() < 32 {
-            return;
-        }
-
-        let flags = udp.payload()[3];
-        if !(flags == 8 || flags == 10) {
-            return;
-        }
-
-        let seq_bytes = &udp.payload()[28..32];
-        let seq = u32::from_le_bytes(seq_bytes.try_into().unwrap()) as u64;
-
-        if self.seqs.contains_key(&seq) {
-            eprintln!(
-                "irtt {}->{}: seq {} received twice",
-                udp.get_source(),
-                udp.get_destination(),
-                seq
-            );
-            return;
-        }
-        self.seqs.insert(seq, PacketData { ts, size });
-    }
-
-    fn get_packets(&self) -> &HashMap<u64, PacketData> {
-        &self.seqs
-    }
-}
-
-/// Can handle iperf3 and irtt packets. Should ideally be a trait on
-/// the FlowParsers but I couldn't get it to work with Rust...
-fn hashmap_match_with(
-    sndr: &HashMap<u64, PacketData>,
-    rcvr: &HashMap<u64, PacketData>,
-) -> Vec<SeqResult> {
-    let mut result: Vec<SeqResult> = Vec::new();
-
-    for (seq, sent) in sndr.iter().sorted_by_key(|(k, _)| **k) {
-        let mut res = SeqResult {
-            ts_sent: timeval_to_jiff(sent.ts),
-            ts_rcvd: jiff::Timestamp::new(0, 0).unwrap(),
-            seq: *seq,
-            owd_ms: f64::NAN,
-            len: sent.size,
-            lost: true,
-        };
-        if let Some(rcvd) = rcvr.get(seq) {
-            res.ts_rcvd = timeval_to_jiff(rcvd.ts);
-            let owd = timeval_to_jiff(rcvd.ts) - res.ts_sent;
-            res.owd_ms = owd.total(jiff::Unit::Millisecond).unwrap();
-            res.lost = false;
-        };
-        result.push(res);
-    }
-
-    result
-}
+mod parsers;
 
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 enum PortType {
@@ -171,17 +40,49 @@ enum PortType {
 
 #[derive(Default)]
 struct ParserMatcher {
-    map: HashMap<(PortType, SocketAddr), BoxedFlowParser>,
+    parsers: HashMap<(IpNextHeaderProtocol, PortType, SocketAddr), FlowParsers>,
 }
 
 impl ParserMatcher {
-    fn new(args: &cli::Args) -> ParserMatcher {
+    fn new(args: cli::Args) -> ParserMatcher {
         let mut m = Self::default();
 
-        m.add_addrs(&args.iperf3_udp_dst, PortType::Dst, FlowParsers::Iperf3Udp);
-        m.add_addrs(&args.iperf3_udp_src, PortType::Src, FlowParsers::Iperf3Udp);
-        m.add_addrs(&args.irtt_dst, PortType::Dst, FlowParsers::Irtt);
-        m.add_addrs(&args.irtt_src, PortType::Src, FlowParsers::Irtt);
+        m.add_addrs(
+            &args.iperf3_udp_dst,
+            IpNextHeaderProtocols::Udp,
+            PortType::Dst,
+            AvailableFlowParsers::Iperf3Udp,
+        );
+        m.add_addrs(
+            &args.iperf3_udp_src,
+            IpNextHeaderProtocols::Udp,
+            PortType::Src,
+            AvailableFlowParsers::Iperf3Udp,
+        );
+        m.add_addrs(
+            &args.irtt_dst,
+            IpNextHeaderProtocols::Udp,
+            PortType::Dst,
+            AvailableFlowParsers::Irtt,
+        );
+        m.add_addrs(
+            &args.irtt_src,
+            IpNextHeaderProtocols::Udp,
+            PortType::Src,
+            AvailableFlowParsers::Irtt,
+        );
+        m.add_addrs(
+            &args.iperf3_tcp_dst,
+            IpNextHeaderProtocols::Tcp,
+            PortType::Dst,
+            AvailableFlowParsers::Iperf3Tcp,
+        );
+        m.add_addrs(
+            &args.iperf3_tcp_src,
+            IpNextHeaderProtocols::Tcp,
+            PortType::Src,
+            AvailableFlowParsers::Iperf3Tcp,
+        );
 
         m
     }
@@ -189,66 +90,152 @@ impl ParserMatcher {
     fn add_addrs(
         &mut self,
         addrs: &Option<Vec<SocketAddr>>,
+        proto: IpNextHeaderProtocol,
         port_type: PortType,
-        parser: FlowParsers,
+        parser: AvailableFlowParsers,
     ) {
         if let Some(addrs) = addrs {
             for addr in addrs {
-                self.map.insert((port_type, *addr), parser.new());
+                self.parsers
+                    .insert((proto, port_type, *addr), parser.into());
             }
         }
     }
 
-    fn match_packet(
-        &mut self,
+    fn get_map_keys(
+        proto: IpNextHeaderProtocol,
         ip_src: IpAddr,
         ip_dst: IpAddr,
-        udp: &UdpPacket<'_>,
+        port_src: u16,
+        port_dst: u16,
+    ) -> [(IpNextHeaderProtocol, PortType, SocketAddr); 6] {
+        let ipv4_wildcard = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+        let ipv6_wildcard = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0));
+        let dst_specific_addr = SocketAddr::new(ip_dst, port_dst);
+        let src_specific_addr = SocketAddr::new(ip_src, port_src);
+
+        let dst_v4_addr = SocketAddr::new(ipv4_wildcard, port_dst);
+        let src_v4_addr = SocketAddr::new(ipv4_wildcard, port_src);
+        let dst_v6_addr = SocketAddr::new(ipv6_wildcard, port_dst);
+        let src_v6_addr = SocketAddr::new(ipv6_wildcard, port_src);
+
+        [
+            (proto, PortType::Dst, dst_v4_addr),
+            (proto, PortType::Src, src_v4_addr),
+            (proto, PortType::Dst, dst_v6_addr),
+            (proto, PortType::Src, src_v6_addr),
+            (proto, PortType::Dst, dst_specific_addr),
+            (proto, PortType::Src, src_specific_addr),
+        ]
+    }
+
+    fn match_packet(
+        &mut self,
+        proto: IpNextHeaderProtocol,
+        payload: &[u8],
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
         ts: timeval,
         size: u16,
     ) {
-        let ipv4_wildcard = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
-        let ipv6_wildcard = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0));
-        let dst_specific_addr = SocketAddr::new(ip_dst, udp.get_destination());
-        let src_specific_addr = SocketAddr::new(ip_src, udp.get_source());
-
-        let dst_v4_addr = SocketAddr::new(ipv4_wildcard, udp.get_destination());
-        let src_v4_addr = SocketAddr::new(ipv4_wildcard, udp.get_source());
-        let dst_v6_addr = SocketAddr::new(ipv6_wildcard, udp.get_destination());
-        let src_v6_addr = SocketAddr::new(ipv6_wildcard, udp.get_source());
-
-        let parser = if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_v4_addr)) {
-            Some(parser)
-        } else if let Some(parser) = self.map.get_mut(&(PortType::Src, src_v4_addr)) {
-            Some(parser)
-        } else if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_v6_addr)) {
-            Some(parser)
-        } else if let Some(parser) = self.map.get_mut(&(PortType::Src, src_v6_addr)) {
-            Some(parser)
-        } else if let Some(parser) = self.map.get_mut(&(PortType::Dst, dst_specific_addr)) {
-            Some(parser)
-        } else if let Some(parser) = self.map.get_mut(&(PortType::Src, src_specific_addr)) {
-            Some(parser)
-        } else {
-            None
-        };
-
-        if let Some(parser) = parser {
-            parser.parse(ts, size, udp);
+        match proto {
+            IpNextHeaderProtocols::Udp => {
+                if let Some(udp) = UdpPacket::new(payload) {
+                    let keys = Self::get_map_keys(
+                        proto,
+                        ip_src,
+                        ip_dst,
+                        udp.get_source(),
+                        udp.get_destination(),
+                    );
+                    for key in keys {
+                        if let Some(parser) = self.parsers.get_mut(&key) {
+                            parser.parse_udp(ts, size, &udp);
+                        }
+                    }
+                }
+            }
+            IpNextHeaderProtocols::Tcp => {
+                if let Some(tcp) = TcpPacket::new(payload) {
+                    let keys = Self::get_map_keys(
+                        proto,
+                        ip_src,
+                        ip_dst,
+                        tcp.get_source(),
+                        tcp.get_destination(),
+                    );
+                    for key in keys {
+                        if let Some(parser) = self.parsers.get_mut(&key) {
+                            parser.parse_tcp(ts, size, &tcp);
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
-    fn iter_parsers(&self) -> impl Iterator<Item = (&(PortType, SocketAddr), &BoxedFlowParser)> {
-        self.map.iter()
+    fn iter_parsers(
+        &self,
+    ) -> impl Iterator<Item = (&(IpNextHeaderProtocol, PortType, SocketAddr), &FlowParsers)> {
+        self.parsers.iter()
     }
 
     fn len(&self) -> usize {
-        self.map.len()
+        self.parsers.len()
     }
 
-    fn get_parser(&self, key: &(PortType, SocketAddr)) -> Option<&BoxedFlowParser> {
-        self.map.get(key)
+    fn get_parser(
+        &self,
+        key: &(IpNextHeaderProtocol, PortType, SocketAddr),
+    ) -> Option<&FlowParsers> {
+        self.parsers.get(key)
     }
+}
+
+fn parse_packet(
+    parsers: &mut ParserMatcher,
+    header: &PacketHeader,
+    eth_type: EtherType,
+    payload: &[u8],
+) {
+    let ts = header.ts;
+    match eth_type {
+        EtherTypes::Ipv4 => {
+            if let Some(ipv4) = Ipv4Packet::new(payload)
+                && (ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp
+                    || ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Tcp)
+            {
+                let size = ipv4.get_total_length() + 20;
+                parsers.match_packet(
+                    ipv4.get_next_level_protocol(),
+                    ipv4.payload(),
+                    IpAddr::V4(ipv4.get_source()),
+                    IpAddr::V4(ipv4.get_destination()),
+                    ts,
+                    size,
+                );
+            }
+        }
+        EtherTypes::Ipv6 => {
+            if let Some(ipv6) = Ipv6Packet::new(payload)
+                && (ipv6.get_next_header() == IpNextHeaderProtocols::Udp
+                    || ipv6.get_next_header() == IpNextHeaderProtocols::Tcp)
+            {
+                let size = ipv6.get_payload_length() + 40;
+                parsers.match_packet(
+                    ipv6.get_next_header(),
+                    ipv6.payload(),
+                    IpAddr::V6(ipv6.get_source()),
+                    IpAddr::V6(ipv6.get_destination()),
+                    ts,
+                    size,
+                );
+            }
+        }
+        EtherTypes::Arp => (),
+        _ => eprintln!("unsupported ether type={}", eth_type),
+    };
 }
 
 fn parse_pcap(path: String, mut parsers: ParserMatcher) -> Result<ParserMatcher> {
@@ -265,7 +252,7 @@ fn parse_pcap(path: String, mut parsers: ParserMatcher) -> Result<ParserMatcher>
                         packet.header,
                         sll2.get_protocol_type(),
                         sll2.payload(),
-                    )?;
+                    );
                 } else {
                     eprintln!("Failed to assemble SSL2Packet");
                 }
@@ -277,66 +264,20 @@ fn parse_pcap(path: String, mut parsers: ParserMatcher) -> Result<ParserMatcher>
                         packet.header,
                         eth.get_ethertype(),
                         eth.payload(),
-                    )?;
+                    );
                 } else {
                     eprintln!("Failed to assemble EthernetPacket");
                 }
             }
             _ => {
                 return Err(anyhow!(
-                    "Can't parse pcap datalink {:?}; currently only LINUX_SLL2 upported",
+                    "Can't parse pcap datalink {:?}; currently only LINUX_SLL2 and ETHERNET upported",
                     datalink
                 ));
             }
         };
     }
     Ok(parsers)
-}
-
-fn parse_packet(
-    parsers: &mut ParserMatcher,
-    header: &PacketHeader,
-    eth_type: EtherType,
-    payload: &[u8],
-) -> Result<()> {
-    let ts = header.ts;
-    match eth_type {
-        EtherTypes::Ipv4 => {
-            if let Some(ipv4) = Ipv4Packet::new(payload) {
-                if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
-                    if let Some(udp) = UdpPacket::new(ipv4.payload()) {
-                        let size = ipv4.get_total_length() + 20;
-                        parsers.match_packet(
-                            IpAddr::V4(ipv4.get_source()),
-                            IpAddr::V4(ipv4.get_destination()),
-                            &udp,
-                            ts,
-                            size,
-                        );
-                    }
-                }
-            }
-        }
-        EtherTypes::Ipv6 => {
-            if let Some(ipv6) = Ipv6Packet::new(payload) {
-                if ipv6.get_next_header() == IpNextHeaderProtocols::Udp {
-                    if let Some(udp) = UdpPacket::new(ipv6.payload()) {
-                        let size = ipv6.get_payload_length() + 40;
-                        parsers.match_packet(
-                            IpAddr::V6(ipv6.get_source()),
-                            IpAddr::V6(ipv6.get_destination()),
-                            &udp,
-                            ts,
-                            size,
-                        );
-                    }
-                }
-            }
-        }
-        _ => eprintln!("unsupported ether type={}", eth_type),
-    };
-
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -353,12 +294,7 @@ impl SeqResult {
     fn to_csv_row(&self) -> String {
         format!(
             "{}\t{}\t{}\t{}\t{}\t{}\n",
-            self.ts_sent.to_string(),
-            self.ts_rcvd.to_string(),
-            self.seq,
-            self.owd_ms,
-            self.len,
-            self.lost
+            self.ts_sent, self.ts_rcvd, self.seq, self.owd_ms, self.len, self.lost
         )
     }
 }
@@ -370,7 +306,7 @@ fn match_parsers(sndr: ParserMatcher, rcvr: ParserMatcher) -> ResultMap {
 
     for (key, sndr_parser) in sndr.iter_parsers() {
         let rcvr_parser = rcvr.get_parser(key).unwrap();
-        let result = hashmap_match_with(sndr_parser.get_packets(), rcvr_parser.get_packets());
+        let result = sndr_parser.match_with(rcvr_parser);
         let negative_owd_count = result
             .iter()
             .filter(|r| f64::is_nan(r.owd_ms) && r.owd_ms < 0.0)
@@ -378,12 +314,12 @@ fn match_parsers(sndr: ParserMatcher, rcvr: ParserMatcher) -> ResultMap {
         if negative_owd_count > 0 {
             eprintln!(
                 "Port {}: encountered {} packets with negative latency",
-                key.1.port(),
+                key.2.port(),
                 negative_owd_count
             );
         }
-        if let Some(_) = results.insert(key.1.port(), result) {
-            eprintln!("Port {} parsed twice", key.1.port());
+        if results.insert(key.2.port(), result).is_some() {
+            eprintln!("Port {} parsed twice", key.2.port());
         }
     }
 
@@ -400,13 +336,18 @@ fn write_out(args: &cli::Args, results: ResultMap) -> Result<()> {
     for (port, seqs) in results.iter() {
         let file_name = format!("{name}.{port}.csv");
         let path_out = base_path.join(file_name);
+        eprintln!(
+            "Write {} rows to {}",
+            seqs.len(),
+            path_out.to_string_lossy()
+        );
         let f = File::create(path_out).context("Failed opening csv file for writing")?;
         let mut f = BufWriter::new(f);
 
         f.write(header).context("Failed writing csv header")?;
 
         for seq_result in seqs {
-            f.write(seq_result.to_csv_row().as_bytes())?;
+            f.write_all(seq_result.to_csv_row().as_bytes())?;
         }
     }
 
@@ -421,26 +362,29 @@ fn main() -> ExitCode {
 
     let sndr_pcap = args.sndr_pcap.clone();
     let rcvr_pcap = args.rcvr_pcap.clone();
-    let sndr_parsers = ParserMatcher::new(&args);
-    let rcvr_parsers = ParserMatcher::new(&args);
+
+    // Turn passed arguments into individual FlowParsers stored in ParserMatcher
+    let sndr_parsers = ParserMatcher::new(args.clone());
+    let rcvr_parsers = ParserMatcher::new(args.clone());
 
     if sndr_parsers.len() == 0 {
         eprintln!("No addresses passed");
         return ExitCode::FAILURE;
     }
 
+    // Parse packets from pcaps in parallel
     thread::spawn(move || {
         eprintln!("Parsing {}", sndr_pcap);
         let parsers = parse_pcap(sndr_pcap, sndr_parsers);
         tx_sndr.send(("sndr", parsers)).unwrap();
     });
-
     thread::spawn(move || {
         eprintln!("Parsing {}", rcvr_pcap);
         let parsers = parse_pcap(rcvr_pcap, rcvr_parsers);
         tx_rcvr.send(("rcvr", parsers)).unwrap();
     });
 
+    // Wait until both parsers have finished and match them back to sndr and rcvr
     let mut sndr_parsers = None;
     let mut rcvr_parsers = None;
     while sndr_parsers.is_none() || rcvr_parsers.is_none() {
@@ -455,8 +399,10 @@ fn main() -> ExitCode {
         }
     }
 
+    // Match sent and received packets
     let results = match_parsers(sndr_parsers.unwrap(), rcvr_parsers.unwrap());
 
+    // Output matches in csv format
     if let Err(e) = write_out(&args, results) {
         eprintln!("{}", e);
         return ExitCode::FAILURE;
