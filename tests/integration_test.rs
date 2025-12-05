@@ -1,4 +1,5 @@
 use std::{
+    fmt::Debug,
     fs::{self, File},
     io::Read,
     path::Path,
@@ -9,7 +10,7 @@ use clap::Parser;
 use pcap_match::{cli::Args, run_args};
 
 #[test]
-fn test_help() {
+fn test_iperf3_udp() {
     let input = vec![
         "pcap-match",
         "--name",
@@ -27,28 +28,72 @@ fn test_help() {
     );
 }
 
-fn run_and_compare<P>(input: Vec<&str>, a_path: P, b_path: P)
+#[test]
+fn test_iperf3_tcp_ipv6() {
+    let input = vec![
+        "pcap-match",
+        "--name",
+        "iperf3_tcp_ipv6_test",
+        "--tcp-dst",
+        "5201",
+        "./tests/iperf3_tcp_ipv6_client.pcap",
+        "./tests/iperf3_tcp_ipv6_server.pcap",
+    ];
+
+    run_and_compare(
+        input,
+        "./tests/iperf3_tcp_ipv6.5201.csv",
+        "./tests/iperf3_tcp_ipv6_test.5201.csv",
+    );
+}
+
+#[test]
+fn test_iperf3_tcp_ipv4() {
+    let input = vec![
+        "pcap-match",
+        "--name",
+        "iperf3_tcp_ipv4_test",
+        "--tcp-dst",
+        "5201",
+        "./tests/iperf3_tcp_ipv4_client.pcap",
+        "./tests/iperf3_tcp_ipv4_server.pcap",
+    ];
+
+    run_and_compare(
+        input,
+        "./tests/iperf3_tcp_ipv4.5201.csv",
+        "./tests/iperf3_tcp_ipv4_test.5201.csv",
+    );
+}
+
+fn run_and_compare<P: Debug>(input: Vec<&str>, expected: P, observed: P)
 where
     P: AsRef<Path>,
 {
     let args = Args::parse_from(input);
     assert_eq!(run_args(args), ExitCode::SUCCESS);
 
-    let mut a = File::open(a_path).unwrap();
-    let mut b = File::open(&b_path).unwrap();
-    assert!(diff_files(&mut a, &mut b), "resulting file differs");
+    let mut f_expected = File::open(&expected)
+        .expect(format!("'Expected' file does not exist: {expected:?}").as_str());
+    let mut f_observed = File::open(&observed)
+        .expect(format!("New output file does not exist: {observed:?}").as_str());
+    assert!(
+        diff_files(&mut f_expected, &mut f_observed),
+        "resulting file differs"
+    );
 
-    fs::remove_file(b_path).unwrap();
+    // Only deleted if test suceeded
+    fs::remove_file(observed).unwrap();
 }
 
 /// Takes two file arguments and returns true if the two files are identical.
-pub fn diff_files(f1: &mut File, f2: &mut File) -> bool {
-    let buff1: &mut [u8] = &mut [0; 1024];
-    let buff2: &mut [u8] = &mut [0; 1024];
+pub fn diff_files(a: &mut File, b: &mut File) -> bool {
+    let buf_a = &mut [0; 1024];
+    let buf_b = &mut [0; 1024];
     loop {
-        match f1.read(buff1) {
+        match a.read(buf_a) {
             Err(_) => return false,
-            Ok(f1_read_len) => match f2.read(buff2) {
+            Ok(f1_read_len) => match b.read(buf_b) {
                 Err(_) => return false,
                 Ok(f2_read_len) => {
                     if f1_read_len != f2_read_len {
@@ -57,7 +102,7 @@ pub fn diff_files(f1: &mut File, f2: &mut File) -> bool {
                     if f1_read_len == 0 {
                         return true;
                     }
-                    if &buff1[0..f1_read_len] != &buff2[0..f2_read_len] {
+                    if &buf_a[0..f1_read_len] != &buf_b[0..f2_read_len] {
                         return false;
                     }
                 }

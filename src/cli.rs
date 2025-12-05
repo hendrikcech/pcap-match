@@ -46,13 +46,21 @@ pub struct Args {
     #[arg(long, help_heading = MATCHING_HEADING, value_parser=parse_matcher)]
     pub irtt_src: Option<Vec<SocketAddr>>,
 
+    /// Match these netmeas (UDP mode) destination ports (or address:port)
+    #[arg(long, help_heading = MATCHING_HEADING, value_parser=parse_matcher)]
+    pub netmeas_dst: Option<Vec<SocketAddr>>,
+
+    /// Match these netmeas (UDP mode) source ports (or address:port)
+    #[arg(long, help_heading = MATCHING_HEADING, value_parser=parse_matcher)]
+    pub netmeas_src: Option<Vec<SocketAddr>>,
+
     /// Match these iperf3 (TCP mode) destination ports (or address:port)
     #[arg(long, help_heading = MATCHING_HEADING, value_parser=parse_matcher)]
-    pub iperf3_tcp_dst: Option<Vec<SocketAddr>>,
+    pub tcp_dst: Option<Vec<SocketAddr>>,
 
     /// Match these iperf3 (TCP mode) source ports (or address:port)
     #[arg(long, help_heading = MATCHING_HEADING, value_parser=parse_matcher)]
-    pub iperf3_tcp_src: Option<Vec<SocketAddr>>,
+    pub tcp_src: Option<Vec<SocketAddr>>,
 
     /// Match only packets with this destination IP address
     #[arg(long, help_heading = MATCHING_HEADING, value_parser=IpAddr::from_str)]

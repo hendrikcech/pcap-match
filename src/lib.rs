@@ -24,8 +24,6 @@ use pnet::packet::{
     udp::UdpPacket,
 };
 
-use libc::timeval;
-
 use crate::{
     cli::Args,
     parsers::{AvailableFlowParsers, FlowParsers},
@@ -75,16 +73,28 @@ impl ParserMatcher {
             AvailableFlowParsers::Irtt,
         );
         m.add_addrs(
-            &args.iperf3_tcp_dst,
-            IpNextHeaderProtocols::Tcp,
+            &args.netmeas_dst,
+            IpNextHeaderProtocols::Udp,
             PortType::Dst,
-            AvailableFlowParsers::Iperf3Tcp,
+            AvailableFlowParsers::Netmeas,
         );
         m.add_addrs(
-            &args.iperf3_tcp_src,
+            &args.netmeas_src,
+            IpNextHeaderProtocols::Udp,
+            PortType::Src,
+            AvailableFlowParsers::Netmeas,
+        );
+        m.add_addrs(
+            &args.tcp_dst,
+            IpNextHeaderProtocols::Tcp,
+            PortType::Dst,
+            AvailableFlowParsers::Tcp,
+        );
+        m.add_addrs(
+            &args.tcp_src,
             IpNextHeaderProtocols::Tcp,
             PortType::Src,
-            AvailableFlowParsers::Iperf3Tcp,
+            AvailableFlowParsers::Tcp,
         );
 
         m
@@ -99,6 +109,7 @@ impl ParserMatcher {
     ) {
         if let Some(addrs) = addrs {
             for addr in addrs {
+                // eprintln!("Add parser {proto} {port_type:?} {parser:?} {addrs:?}");
                 self.parsers
                     .insert((proto, port_type, *addr), parser.into());
             }
@@ -138,7 +149,7 @@ impl ParserMatcher {
         payload: &[u8],
         ip_src: IpAddr,
         ip_dst: IpAddr,
-        ts: timeval,
+        ts: jiff::Timestamp,
         size: u16,
     ) {
         match proto {
@@ -202,7 +213,7 @@ fn parse_packet(
     eth_type: EtherType,
     payload: &[u8],
 ) {
-    let ts = header.ts;
+    let ts = parsers::timeval_to_jiff(header.ts);
     match eth_type {
         EtherTypes::Ipv4 => {
             if let Some(ipv4) = Ipv4Packet::new(payload)
@@ -302,20 +313,37 @@ fn parse_pcap(path: String, mut parsers: ParserMatcher) -> Result<ParserMatcher>
 #[derive(Debug)]
 struct SeqResult {
     ts_sent: jiff::Timestamp,
-    ts_rcvd: jiff::Timestamp,
+    ts_rcvd: Option<jiff::Timestamp>,
     seq: u64,
-    owd_ms: f64,
-    len: u16,
+    owd_ms: Option<f64>,
+    size: u16,
     lost: bool,
 }
 
+
+// Legacy
+// let header = "ts_sent\tts_rcvd\tseq\tlatency_ms\tlen\tlost\n".as_bytes();
+const CSV_HEADER: &[u8] = "seq,ts_sent,ts_rcvd,owd_ms,size,lost\n".as_bytes();
+
 impl SeqResult {
     fn to_csv_row(&self) -> String {
+        let ts_rcvd = self.ts_rcvd.map_or("".to_string(), |ts| ts.to_string());
+        let owd_ms = self
+            .owd_ms
+            .map_or("".to_string(), |owd_ms| owd_ms.to_string());
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\n",
-            self.ts_sent, self.ts_rcvd, self.seq, self.owd_ms, self.len, self.lost
+            "{},{},{},{},{},{}\n",
+            self.seq, self.ts_sent, ts_rcvd, owd_ms, self.size, self.lost
         )
     }
+
+    // Legacy format
+    // fn to_csv_row(&self) -> String {
+    //     format!(
+    //         "{}\t{}\t{}\t{}\t{}\t{}\n",
+    //         self.ts_sent, self.ts_rcvd, self.seq, self.owd_ms, self.len, self.lost
+    //     )
+    // }
 }
 
 type ResultMap = HashMap<u16, Vec<SeqResult>>;
@@ -325,10 +353,10 @@ fn match_parsers(sndr: ParserMatcher, rcvr: ParserMatcher) -> ResultMap {
 
     for (key, sndr_parser) in sndr.iter_parsers() {
         let rcvr_parser = rcvr.get_parser(key).unwrap();
-        let result = sndr_parser.match_with(rcvr_parser);
+        let result = sndr_parser.match_with_rcvr(rcvr_parser);
         let negative_owd_count = result
             .iter()
-            .filter(|r| f64::is_nan(r.owd_ms) && r.owd_ms < 0.0)
+            .filter(|r| r.owd_ms.is_some_and(|owd_ms| owd_ms < 0.0))
             .count();
         if negative_owd_count > 0 {
             eprintln!(
@@ -350,8 +378,6 @@ fn write_out(args: &cli::Args, results: ResultMap) -> Result<()> {
     let base_path = PathBuf::from(args.sndr_pcap.clone());
     let base_path = base_path.parent().unwrap();
 
-    let header = "ts_sent\tts_rcvd\tseq\tlatency_ms\tlen\tlost\n".as_bytes();
-
     for (port, seqs) in results.iter() {
         let file_name = format!("{name}.{port}.csv");
         let path_out = base_path.join(file_name);
@@ -363,7 +389,7 @@ fn write_out(args: &cli::Args, results: ResultMap) -> Result<()> {
         let f = File::create(path_out).context("Failed opening csv file for writing")?;
         let mut f = BufWriter::new(f);
 
-        f.write(header).context("Failed writing csv header")?;
+        f.write(CSV_HEADER).context("Failed writing csv header")?;
 
         for seq_result in seqs {
             f.write_all(seq_result.to_csv_row().as_bytes())?;

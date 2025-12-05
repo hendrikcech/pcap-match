@@ -1,23 +1,29 @@
 use std::{collections::HashMap, ops::Deref};
 
-use pnet::packet::{Packet, tcp::TcpPacket, udp::UdpPacket};
+use pnet::packet::{
+    Packet,
+    tcp::{TcpOptionNumbers, TcpPacket},
+    udp::UdpPacket,
+};
 
 use libc::timeval;
 
 use crate::SeqResult;
 use itertools::Itertools;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum AvailableFlowParsers {
     Iperf3Udp,
     Irtt,
-    Iperf3Tcp,
+    Tcp,
+    Netmeas,
 }
 
 pub enum FlowParsers {
     Iperf3Udp(Box<dyn for<'a> FlowParser<'a, Packet = UdpPacket<'a>, Key = u64>>),
     Irtt(Box<dyn for<'a> FlowParser<'a, Packet = UdpPacket<'a>, Key = u64>>),
-    Iperf3Tcp(Box<dyn for<'a> FlowParser<'a, Packet = TcpPacket<'a>, Key = u64>>),
+    Netmeas(Box<dyn for<'a> FlowParser<'a, Packet = UdpPacket<'a>, Key = u64>>),
+    Tcp(Box<dyn for<'a> FlowParser<'a, Packet = TcpPacket<'a>, Key = TcpKey>>),
 }
 
 impl From<AvailableFlowParsers> for FlowParsers {
@@ -27,36 +33,54 @@ impl From<AvailableFlowParsers> for FlowParsers {
                 FlowParsers::Iperf3Udp(Box::new(Iperf3UdpParser::default()))
             }
             AvailableFlowParsers::Irtt => FlowParsers::Irtt(Box::new(IrttParser::default())),
-            AvailableFlowParsers::Iperf3Tcp => {
-                FlowParsers::Iperf3Tcp(Box::new(Iperf3TcpParser::default()))
+            AvailableFlowParsers::Netmeas => {
+                FlowParsers::Netmeas(Box::new(NetmeasParser::default()))
+            }
+            AvailableFlowParsers::Tcp => {
+                FlowParsers::Tcp(Box::new(Iperf3TcpParser::default()))
             }
         }
     }
 }
 
 impl FlowParsers {
-    pub fn parse_udp(&mut self, ts: timeval, size: u16, packet: &UdpPacket) {
+    pub fn parse_udp(&mut self, ts: jiff::Timestamp, size: u16, packet: &UdpPacket) {
         match self {
             FlowParsers::Iperf3Udp(p) => p.parse(ts, size, packet),
             FlowParsers::Irtt(p) => p.parse(ts, size, packet),
-            FlowParsers::Iperf3Tcp(_) => unreachable!(),
+            FlowParsers::Netmeas(p) => p.parse(ts, size, packet),
+            FlowParsers::Tcp(_) => unreachable!(),
         }
     }
 
-    pub fn parse_tcp(&mut self, ts: timeval, size: u16, packet: &TcpPacket) {
+    pub fn parse_tcp(&mut self, ts: jiff::Timestamp, size: u16, packet: &TcpPacket) {
         match self {
             FlowParsers::Iperf3Udp(_) => unreachable!(),
             FlowParsers::Irtt(_) => unreachable!(),
-            FlowParsers::Iperf3Tcp(p) => p.parse(ts, size, packet),
+            FlowParsers::Netmeas(_) => unreachable!(),
+            FlowParsers::Tcp(p) => p.parse(ts, size, packet),
         }
     }
 
-    pub fn match_with(&self, other: &FlowParsers) -> Vec<SeqResult> {
-        match (self, other) {
-            (FlowParsers::Iperf3Udp(a), FlowParsers::Iperf3Udp(b)) => a.match_with(b.deref()),
-            (FlowParsers::Irtt(a), FlowParsers::Irtt(b)) => a.match_with(b.deref()),
-            (FlowParsers::Iperf3Tcp(a), FlowParsers::Iperf3Tcp(b)) => a.match_with(b.deref()),
-            _ => unreachable!(),
+    pub fn match_with_rcvr(&self, rcvr: &FlowParsers) -> Vec<SeqResult> {
+        match (self, rcvr) {
+            (FlowParsers::Iperf3Udp(a), FlowParsers::Iperf3Udp(b)) => a.match_with_rcvr(b.deref()),
+            (FlowParsers::Irtt(a), FlowParsers::Irtt(b)) => a.match_with_rcvr(b.deref()),
+            (FlowParsers::Netmeas(a), FlowParsers::Netmeas(b)) => a.match_with_rcvr(b.deref()),
+            (FlowParsers::Tcp(a), FlowParsers::Tcp(b)) => a.match_with_rcvr(b.deref()),
+
+            (FlowParsers::Iperf3Udp(_), FlowParsers::Irtt(_)) => unreachable!(),
+            (FlowParsers::Iperf3Udp(_), FlowParsers::Netmeas(_)) => unreachable!(),
+            (FlowParsers::Iperf3Udp(_), FlowParsers::Tcp(_)) => unreachable!(),
+            (FlowParsers::Irtt(_), FlowParsers::Iperf3Udp(_)) => unreachable!(),
+            (FlowParsers::Irtt(_), FlowParsers::Netmeas(_)) => unreachable!(),
+            (FlowParsers::Irtt(_), FlowParsers::Tcp(_)) => unreachable!(),
+            (FlowParsers::Netmeas(_), FlowParsers::Iperf3Udp(_)) => unreachable!(),
+            (FlowParsers::Netmeas(_), FlowParsers::Irtt(_)) => unreachable!(),
+            (FlowParsers::Netmeas(_), FlowParsers::Tcp(_)) => unreachable!(),
+            (FlowParsers::Tcp(_), FlowParsers::Iperf3Udp(_)) => unreachable!(),
+            (FlowParsers::Tcp(_), FlowParsers::Irtt(_)) => unreachable!(),
+            (FlowParsers::Tcp(_), FlowParsers::Netmeas(_)) => unreachable!(),
         }
     }
 }
@@ -65,25 +89,25 @@ pub trait FlowParser<'a>: Send {
     type Packet: Packet;
     type Key;
 
-    fn parse(&mut self, ts: timeval, size: u16, packet: &Self::Packet);
+    fn parse(&mut self, ts: jiff::Timestamp, size: u16, packet: &Self::Packet);
 
     fn get_packets(&self) -> &HashMap<Self::Key, PacketData>;
 
-    fn match_with(
+    fn match_with_rcvr(
         &self,
-        other: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
+        rcvr: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
     ) -> Vec<SeqResult>;
 }
 
 #[derive(Clone)]
 /// Metadata of each parsed packet used for matching.
 pub struct PacketData {
-    ts: timeval,
+    ts: jiff::Timestamp,
     size: u16,
 }
 
 #[inline(always)]
-fn timeval_to_jiff(ts: timeval) -> jiff::Timestamp {
+pub fn timeval_to_jiff(ts: timeval) -> jiff::Timestamp {
     let ns = ts.tv_usec * 1000;
     jiff::Timestamp::new(ts.tv_sec, ns.try_into().unwrap()).unwrap()
 }
@@ -97,17 +121,17 @@ fn hashmap_match_u64(
 
     for (seq, sent) in sndr.iter().sorted_by_key(|(k, _)| **k) {
         let mut res = SeqResult {
-            ts_sent: timeval_to_jiff(sent.ts),
-            ts_rcvd: jiff::Timestamp::new(0, 0).unwrap(),
+            ts_sent: sent.ts,
+            ts_rcvd: None,
             seq: *seq,
-            owd_ms: f64::NAN,
-            len: sent.size,
+            owd_ms: None,
+            size: sent.size,
             lost: true,
         };
         if let Some(rcvd) = rcvr.get(seq) {
-            res.ts_rcvd = timeval_to_jiff(rcvd.ts);
-            let owd = timeval_to_jiff(rcvd.ts) - res.ts_sent;
-            res.owd_ms = owd.total(jiff::Unit::Millisecond).unwrap();
+            res.ts_rcvd = Some(rcvd.ts);
+            let owd = rcvd.ts - res.ts_sent;
+            res.owd_ms = Some(owd.total(jiff::Unit::Millisecond).unwrap());
             res.lost = false;
         };
         result.push(res);
@@ -125,7 +149,7 @@ impl<'a> FlowParser<'a> for Iperf3UdpParser {
     type Packet = UdpPacket<'a>;
     type Key = u64;
 
-    fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket) {
+    fn parse(&mut self, ts: jiff::Timestamp, size: u16, udp: &UdpPacket) {
         if udp.payload().len() < 12 {
             return;
         }
@@ -147,11 +171,11 @@ impl<'a> FlowParser<'a> for Iperf3UdpParser {
         &self.seqs
     }
 
-    fn match_with(
+    fn match_with_rcvr(
         &self,
-        other: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
+        rcvr: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
     ) -> Vec<SeqResult> {
-        hashmap_match_u64(self.get_packets(), other.get_packets())
+        hashmap_match_u64(self.get_packets(), rcvr.get_packets())
     }
 }
 
@@ -170,11 +194,12 @@ impl<'a> FlowParser<'a> for IrttParser {
     type Packet = UdpPacket<'a>;
     type Key = u64;
 
-    fn parse(&mut self, ts: timeval, size: u16, udp: &UdpPacket) {
+    fn parse(&mut self, ts: jiff::Timestamp, size: u16, udp: &UdpPacket) {
         if udp.payload().len() < 32 {
             return;
         }
 
+        // TODO: IRTT seems to be broken currently
         let flags = udp.payload()[3];
         if !(flags == 8 || flags == 10) {
             return;
@@ -199,40 +224,151 @@ impl<'a> FlowParser<'a> for IrttParser {
         &self.seqs
     }
 
-    fn match_with(
+    fn match_with_rcvr(
         &self,
-        other: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
+        rcvr: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
     ) -> Vec<SeqResult> {
-        hashmap_match_u64(self.get_packets(), other.get_packets())
+        hashmap_match_u64(self.get_packets(), rcvr.get_packets())
     }
 }
 
 #[derive(Default, Clone)]
-struct Iperf3TcpParser {
+struct NetmeasParser {
     seqs: HashMap<u64, PacketData>,
 }
 
-impl<'a> FlowParser<'a> for Iperf3TcpParser {
-    type Packet = TcpPacket<'a>;
+/// Netmeas format
+/// u64 id in first 8 byte
+impl<'a> FlowParser<'a> for NetmeasParser {
+    type Packet = UdpPacket<'a>;
     type Key = u64;
 
-    fn parse(&mut self, _ts: timeval, _size: u16, _packet: &TcpPacket) {
-        todo!()
-        // tcp.get_sequence()
-        // tcp.get
+    fn parse(&mut self, ts: jiff::Timestamp, size: u16, udp: &UdpPacket) {
+        if udp.payload().len() < 8 {
+            return;
+        }
 
-        // self.seqs.insert(seq, PacketData { ts, size });
+        let seq_bytes = &udp.payload()[..8];
+        let seq = u64::from_be_bytes(seq_bytes.try_into().unwrap());
+
+        if self.seqs.contains_key(&seq) {
+            eprintln!(
+                "netmeas {}->{}: seq {} received twice",
+                udp.get_source(),
+                udp.get_destination(),
+                seq
+            );
+            return;
+        }
+        self.seqs.insert(seq, PacketData { ts, size });
     }
 
     fn get_packets(&self) -> &HashMap<Self::Key, PacketData> {
         &self.seqs
     }
 
-    fn match_with(
+    fn match_with_rcvr(
         &self,
-        _other: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
+        rcvr: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
     ) -> Vec<SeqResult> {
-        todo!()
-        // hashmap_match_with(self.get_packets(), other.get_packets())
+        hashmap_match_u64(self.get_packets(), rcvr.get_packets())
+    }
+}
+
+#[derive(Default, Clone)]
+struct Iperf3TcpParser {
+    seqs: HashMap<TcpKey, PacketData>,
+}
+
+/// Key used to match TCP packets.
+/// Can't use checksum since it takes the IP addresses into account which are often NATed.
+/// sequence number, ack seq num, flags, TCP timestamp option (ts_val + ts_ecr)
+type TcpKey = (u32, u32, u8, u64);
+
+impl<'a> FlowParser<'a> for Iperf3TcpParser {
+    type Packet = TcpPacket<'a>;
+    type Key = TcpKey;
+
+    fn parse(&mut self, ts: jiff::Timestamp, size: u16, packet: &TcpPacket) {
+        let packet_seq = packet.get_sequence();
+        let packet_ack = packet.get_acknowledgement();
+
+        // let checksum = packet.get_checksum();
+        let flags = packet.get_flags();
+
+        let ts_sum = if let Some(opt) = packet
+            .get_options_iter()
+            .find(|opt| opt.get_number() == TcpOptionNumbers::TIMESTAMPS)
+        {
+            let payload = opt.payload();
+
+            if payload.len() < 8 {
+                eprintln!("Unexpected TCP Timestamp option size");
+                return;
+            }
+            let ts_val_bytes: [u8; 4] = payload[0..4].try_into().unwrap();
+            let ts_ecr_bytes: [u8; 4] = payload[4..8].try_into().unwrap();
+
+            let ts_val = u32::from_be_bytes(ts_val_bytes);
+            let ts_ecr = u32::from_be_bytes(ts_ecr_bytes);
+
+            ts_val as u64 + ts_ecr as u64
+        } else {
+            eprintln!("TCP packet contains no timestamp");
+            return;
+        };
+
+        let key: TcpKey = (packet_seq, packet_ack, flags, ts_sum);
+
+        if self.seqs.contains_key(&key) {
+            eprintln!(
+                "netmeas {}->{} {}: key {:?} duplicate",
+                packet.get_source(),
+                packet.get_destination(),
+                ts,
+                key
+            );
+            return;
+        }
+        self.seqs.insert(key, PacketData { ts, size });
+    }
+
+    fn get_packets(&self) -> &HashMap<Self::Key, PacketData> {
+        &self.seqs
+    }
+
+    fn match_with_rcvr(
+        &self,
+        rcvr: &dyn FlowParser<Packet = Self::Packet, Key = Self::Key>,
+    ) -> Vec<SeqResult> {
+        let mut result: Vec<SeqResult> = Vec::new();
+
+        let rcvd = rcvr.get_packets();
+
+        // Sort sent packets by sent_ts and sequence number. Also sorting by sequence number
+        // is important to get a stable order (and packet IDs) during multiple runs.
+        let sent = self
+            .get_packets()
+            .iter()
+            .sorted_by_key(|((seq, _, _, _), PacketData { ts, .. })| (ts, seq));
+        for (i, (key, sent_packet)) in sent.enumerate() {
+            let mut res = SeqResult {
+                ts_sent: sent_packet.ts,
+                ts_rcvd: None,
+                seq: i as u64,
+                owd_ms: None,
+                size: sent_packet.size,
+                lost: true,
+            };
+            if let Some(rcvd_packet) = rcvd.get(key) {
+                res.ts_rcvd = Some(rcvd_packet.ts);
+                let owd = rcvd_packet.ts - res.ts_sent;
+                res.owd_ms = Some(owd.total(jiff::Unit::Millisecond).unwrap());
+                res.lost = false;
+            };
+            result.push(res);
+        }
+
+        result
     }
 }
