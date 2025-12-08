@@ -320,7 +320,6 @@ struct SeqResult {
     lost: bool,
 }
 
-
 // Legacy
 // let header = "ts_sent\tts_rcvd\tseq\tlatency_ms\tlen\tlost\n".as_bytes();
 const CSV_HEADER: &[u8] = "seq,ts_sent,ts_rcvd,owd_ms,size,lost\n".as_bytes();

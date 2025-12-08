@@ -66,6 +66,25 @@ fn test_iperf3_tcp_ipv4() {
     );
 }
 
+#[test]
+fn test_tcp_rst() {
+    let input = vec![
+        "pcap-match",
+        "--name",
+        "tcp_rst_test",
+        "--tcp-src",
+        "41599",
+        "./tests/tcp_rst_sndr.pcap",
+        "./tests/tcp_rst_rcvr.pcap",
+    ];
+
+    run_and_compare(
+        input,
+        "./tests/tcp_rst.41599.csv",
+        "./tests/tcp_rst_test.41599.csv",
+    );
+}
+
 fn run_and_compare<P: Debug>(input: Vec<&str>, expected: P, observed: P)
 where
     P: AsRef<Path>,

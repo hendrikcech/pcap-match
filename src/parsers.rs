@@ -2,7 +2,7 @@ use std::{collections::HashMap, ops::Deref};
 
 use pnet::packet::{
     Packet,
-    tcp::{TcpOptionNumbers, TcpPacket},
+    tcp::{TcpFlags, TcpOptionNumbers, TcpPacket},
     udp::UdpPacket,
 };
 
@@ -36,9 +36,7 @@ impl From<AvailableFlowParsers> for FlowParsers {
             AvailableFlowParsers::Netmeas => {
                 FlowParsers::Netmeas(Box::new(NetmeasParser::default()))
             }
-            AvailableFlowParsers::Tcp => {
-                FlowParsers::Tcp(Box::new(Iperf3TcpParser::default()))
-            }
+            AvailableFlowParsers::Tcp => FlowParsers::Tcp(Box::new(Iperf3TcpParser::default())),
         }
     }
 }
@@ -313,8 +311,19 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
             let ts_ecr = u32::from_be_bytes(ts_ecr_bytes);
 
             ts_val as u64 + ts_ecr as u64
+        } else if (flags & TcpFlags::RST) != 0 {
+            // It is expected that RST packets don't contain timestamps.
+            // We can't reliably differentiate these from each other.
+            // Ignore them.
+            return;
         } else {
-            eprintln!("TCP packet contains no timestamp");
+            eprintln!(
+                "TCP {}->{} {}: ignore packet with no timestamp: {:?}",
+                packet.get_source(),
+                packet.get_destination(),
+                ts,
+                (packet_seq, packet_ack, "?")
+            );
             return;
         };
 
@@ -322,7 +331,7 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
 
         if self.seqs.contains_key(&key) {
             eprintln!(
-                "netmeas {}->{} {}: key {:?} duplicate",
+                "TCP {}->{} {}: key {:?} duplicate",
                 packet.get_source(),
                 packet.get_destination(),
                 ts,
