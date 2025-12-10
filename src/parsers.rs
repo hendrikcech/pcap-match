@@ -353,6 +353,7 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
         let mut result: Vec<SeqResult> = Vec::new();
 
         let rcvd = rcvr.get_packets();
+        let mut rcvd_match_count = 0;
 
         // Sort sent packets by sent_ts and sequence number. Also sorting by sequence number
         // is important to get a stable order (and packet IDs) during multiple runs.
@@ -374,8 +375,18 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
                 let owd = rcvd_packet.ts - res.ts_sent;
                 res.owd_ms = Some(owd.total(jiff::Unit::Millisecond).unwrap());
                 res.lost = false;
+                rcvd_match_count += 1;
             };
             result.push(res);
+        }
+
+        // Check that we haven't recorded any spurious received packets that have never been sent (according to our parsing logic).
+        if rcvd_match_count != rcvd.len() {
+            eprintln!(
+                "TCP ERROR: found {} received packets, but only matched {} packets",
+                rcvd.len(),
+                rcvd_match_count
+            );
         }
 
         result

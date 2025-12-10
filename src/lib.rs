@@ -381,7 +381,7 @@ fn write_out(args: &cli::Args, results: ResultMap) -> Result<()> {
         let file_name = format!("{name}.{port}.csv");
         let path_out = base_path.join(file_name);
         eprintln!(
-            "Write {} rows to {}",
+            "Writing {} rows to {}",
             seqs.len(),
             path_out.to_string_lossy()
         );
