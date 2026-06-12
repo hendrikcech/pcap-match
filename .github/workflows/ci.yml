@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  standalone:
+    name: CI Standalone
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: Update submodules
+      run: git submodule update --init
+    - name: Build
+      run: cargo build -F static --verbose
+    - name: Run tests
+      run: cargo test -F static --verbose
+
+  apt:
+    name: CI Apt-Get
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: Update submodules
+      run: git submodule update --init
+    - name: Install system dependencies (libpcap)
+      run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+    - name: Build
+      run: cargo build --verbose
+    - name: Run tests
+      run: cargo test --verbose
+
+  nix:
+    name: CI Nix
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: Update submodules
+      run: git submodule update --init
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+    - name: Nix Build
+      run: nix build -L
+    - name: Nix Flake Check (Cargo Test)
+      run: nix flake check -L
+    - name: Run resulting binary
+      run: ./result/bin/pcap-match --help
