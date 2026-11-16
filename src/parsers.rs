@@ -129,7 +129,7 @@ fn hashmap_match_u64(
         if let Some(rcvd) = rcvr.get(seq) {
             res.ts_rcvd = Some(rcvd.ts);
             let owd = rcvd.ts - res.ts_sent;
-            res.owd_ms = Some(owd.total(jiff::Unit::Millisecond).unwrap());
+            res.owd_ms = Some(owd.as_millis_f64());
             res.lost = false;
         };
         result.push(res);
@@ -370,7 +370,7 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
             if let Some(rcvd_packet) = rcvd.get(key) {
                 res.ts_rcvd = Some(rcvd_packet.ts);
                 let owd = rcvd_packet.ts - res.ts_sent;
-                res.owd_ms = Some(owd.total(jiff::Unit::Millisecond).unwrap());
+                res.owd_ms = Some(owd.as_millis_f64());
                 res.lost = false;
                 rcvd_match_count += 1;
             };
@@ -394,7 +394,36 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
 mod tests {
     use pnet::packet::tcp::{TcpFlags, TcpPacket};
 
-    use super::{FlowParser, Iperf3TcpParser};
+    use super::{FlowParser, Iperf3TcpParser, PacketData, hashmap_match_u64};
+
+    #[test]
+    fn matching_preserves_fractional_and_negative_delays() {
+        let sent = jiff::Timestamp::new(1, 0).unwrap();
+        for (nanos, expected) in [(1_250_000, 1.25), (-1_250_000, -1.25)] {
+            let received = jiff::Timestamp::new(1, nanos).unwrap();
+            let sender = [(1, PacketData { ts: sent, size: 1 })].into();
+            let receiver = [(
+                1,
+                PacketData {
+                    ts: received,
+                    size: 1,
+                },
+            )]
+            .into();
+            assert_eq!(
+                hashmap_match_u64(&sender, &receiver)[0].owd_ms,
+                Some(expected)
+            );
+
+            let mut sender = Iperf3TcpParser::default();
+            let mut receiver = Iperf3TcpParser::default();
+            let bytes = tcp_packet(1);
+            let packet = TcpPacket::new(&bytes).unwrap();
+            sender.parse(sent, 1, &packet);
+            receiver.parse(received, 1, &packet);
+            assert_eq!(sender.match_with_rcvr(&receiver)[0].owd_ms, Some(expected));
+        }
+    }
 
     fn tcp_packet(seq: u32) -> [u8; 32] {
         let mut bytes = [0; 32];
