@@ -276,6 +276,7 @@ impl<'a> FlowParser<'a> for NetmeasParser {
 #[derive(Default, Clone)]
 struct Iperf3TcpParser {
     seqs: HashMap<TcpKey, PacketData>,
+    order: Vec<TcpKey>,
 }
 
 /// Key used to match TCP packets.
@@ -339,6 +340,7 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
             );
             return;
         }
+        self.order.push(key);
         self.seqs.insert(key, PacketData { ts, size });
     }
 
@@ -355,13 +357,8 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
         let rcvd = rcvr.get_packets();
         let mut rcvd_match_count = 0;
 
-        // Sort sent packets by sent_ts and sequence number. Also sorting by sequence number
-        // is important to get a stable order (and packet IDs) during multiple runs.
-        let sent = self
-            .get_packets()
-            .iter()
-            .sorted_by_key(|((seq, _, _, _), PacketData { ts, .. })| (ts, seq));
-        for (i, (key, sent_packet)) in sent.enumerate() {
+        for (i, key) in self.order.iter().enumerate() {
+            let sent_packet = &self.seqs[key];
             let mut res = SeqResult {
                 ts_sent: sent_packet.ts,
                 ts_rcvd: None,
@@ -390,5 +387,85 @@ impl<'a> FlowParser<'a> for Iperf3TcpParser {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pnet::packet::tcp::{TcpFlags, TcpPacket};
+
+    use super::{FlowParser, Iperf3TcpParser};
+
+    fn tcp_packet(seq: u32) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[0..2].copy_from_slice(&12345u16.to_be_bytes());
+        bytes[2..4].copy_from_slice(&5201u16.to_be_bytes());
+        bytes[4..8].copy_from_slice(&seq.to_be_bytes());
+        bytes[8..12].copy_from_slice(&7u32.to_be_bytes());
+        bytes[12] = 8 << 4;
+        bytes[13] = TcpFlags::ACK;
+        bytes[14..16].copy_from_slice(&4096u16.to_be_bytes());
+        bytes[20] = 8;
+        bytes[21] = 10;
+        bytes[22..26].copy_from_slice(&1u32.to_be_bytes());
+        bytes[26..30].copy_from_slice(&2u32.to_be_bytes());
+        bytes
+    }
+
+    fn parse(parser: &mut Iperf3TcpParser, seq: u32, seconds: i64, size: u16) {
+        let bytes = tcp_packet(seq);
+        let packet = TcpPacket::new(&bytes).unwrap();
+        parser.parse(jiff::Timestamp::new(seconds, 0).unwrap(), size, &packet);
+    }
+
+    #[test]
+    fn tcp_matching_preserves_sender_record_order() {
+        let sender_packets = [
+            (4_294_964_875, 1),
+            (4_294_966_323, 1),
+            (475, 1),
+            (1923, 0),
+            (3371, 1),
+        ];
+        let mut sender = Iperf3TcpParser::default();
+        for (i, (seq, seconds)) in sender_packets.into_iter().enumerate() {
+            parse(&mut sender, seq, seconds, 1000 + i as u16);
+        }
+        // A duplicate is excluded and must not create another ordered row.
+        parse(&mut sender, sender_packets[0].0, 99, 2000);
+
+        let receiver_order = [0, 2, 1, 4, 3];
+        let mut receiver = Iperf3TcpParser::default();
+        for (i, sender_index) in receiver_order.into_iter().enumerate() {
+            parse(
+                &mut receiver,
+                sender_packets[sender_index].0,
+                10 + i as i64,
+                1000,
+            );
+        }
+
+        let matched = sender.match_with_rcvr(&receiver);
+        assert_eq!(matched.len(), sender_packets.len());
+        assert_eq!(
+            matched.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            (0..sender_packets.len() as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            matched.iter().map(|row| row.ts_sent).collect::<Vec<_>>(),
+            sender_packets
+                .iter()
+                .map(|(_, seconds)| jiff::Timestamp::new(*seconds, 0).unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            matched.iter().map(|row| row.ts_rcvd).collect::<Vec<_>>(),
+            [10, 12, 11, 14, 13].map(|seconds| Some(jiff::Timestamp::new(seconds, 0).unwrap()))
+        );
+        assert_eq!(
+            matched.iter().map(|row| row.size).collect::<Vec<_>>(),
+            [1000, 1001, 1002, 1003, 1004]
+        );
+        assert!(matched.iter().all(|row| !row.lost));
     }
 }
